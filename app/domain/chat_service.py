@@ -1,41 +1,51 @@
 from typing import List
-from app.core.ports import ChatLLMPort, HistoryRepoPort
+from app.core.ports import ChatLLMPort
 from app.domain.rag_service import RAGService
 
 SYSTEM_BASE = (
-    "You are a helpful assistant. Use the provided context if relevant; "
-    "otherwise answer from general knowledge. Be concise."
+    "You are a helpful assistant. Use provided context if relevant; "
+    "otherwise answer from general knowledge."
 )
 
+
 class ChatService:
-    def __init__(self, llm: ChatLLMPort, rag: RAGService, history_repo: HistoryRepoPort):
+    """
+    Pure domain logic: create prompt, call LLM, update in-memory RAG.
+    Persistence happens in the UI layer.
+    """
+
+    def __init__(self, llm: ChatLLMPort, rag: RAGService):
         self.llm = llm
         self.rag = rag
-        self.history_repo = history_repo
 
-    def answer(self, user_id: str, chat_history: List[dict], user_query: str) -> tuple[str, List[dict]]:
-        # Retrieve context
+    def answer(self, chat_history: List[dict], user_query: str) -> tuple[str, List[dict]]:
+        # --- retrieve ---
         hits = self.rag.retrieve(user_query)
-        context = "\n\n".join(h.text for h in hits)
+        context = "\n\n".join(h.text for h in hits).strip()
 
-        # Compose Bedrock Converse-style messages
+        # --- craft messages ---
+        system_blocks = [{"text": SYSTEM_BASE}]
+        if context:
+            system_blocks.append({"text": f"Context:\n{context}"})
+
         messages = [
-            {"role": "system", "content": [{"text": SYSTEM_BASE}]},
+            {"role": m["role"], "content": [{"text": m["content"]}]}
+            for m in chat_history[-10:]  # last N
+            if m["role"] in ("user", "assistant")
         ]
-        if context.strip():
-            messages.append({"role": "system", "content": [{"text": f"Context:\n{context}"}]})
-        # add prior turns (short form)
-        for m in chat_history[-10:]:
-            messages.append({"role": m["role"], "content": [{"text": m["content"]}]})
         messages.append({"role": "user", "content": [{"text": user_query}]})
 
-        answer = self.llm.chat(messages)
+        # --- LLM call ---
+        answer_text = self.llm.chat(
+            [{"role": "system", "content": system_blocks}, *messages]
+        )
 
-        # Update in-memory RAG with fresh content to keep chat “up”
-        self.rag.add_to_memory([f"USER: {user_query}", f"ASSISTANT: {answer}"])
+        # --- update memory store for short-term recall ---
+        self.rag.add_to_memory([f"USER: {user_query}", f"ASSISTANT: {answer_text}"])
 
-        # Persist history (append then save)
-        updated = chat_history + [{"role": "user", "content": user_query},
-                                  {"role": "assistant", "content": answer}]
-        self.history_repo.save(user_id, updated)
-        return answer, updated
+        # --- return updated history ---
+        updated_hist = chat_history + [
+            {"role": "user", "content": user_query},
+            {"role": "assistant", "content": answer_text},
+        ]
+        return answer_text, updated_hist
